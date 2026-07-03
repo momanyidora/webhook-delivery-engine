@@ -1,3 +1,4 @@
+import { generateSignature } from "./signatureService";
 
 
 export interface DeiveryResult{
@@ -10,11 +11,13 @@ export async function deliverWebhook(
     destination: string,
     payload: object
 ): Promise<DeiveryResult>{
+    const signature = generateSignature(payload);
     try{
         const response = await fetch(destination,{
             method: "POST",
             headers: {
-                "content-Type": "application/json",
+                "Content-Type": "application/json",
+                "X-Signature": signature,
             },
             body: JSON.stringify(payload)
         });
@@ -30,6 +33,7 @@ export async function deliverWebhook(
             errorMessage: response.statusText
         };
     }catch(error){
+        console.error(error);
  return{
     success: false,
     errorMessage:
