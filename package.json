@@ -4,14 +4,14 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/serve.js",
+    "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js",
+    "start": "node dist/server.ts",
     "test": "vitest",
     "test:run": "vitest run" 
     },
   "keywords": [],
-  "author": "",
+  "author": "Dorah",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
