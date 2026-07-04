@@ -1,5 +1,7 @@
 import { Request, Response } from "express";
-import { createWebhookEvent, listDeadLetters, replayEvent } from "../services/eventService";
+import { createWebhookEvent, listDeadLetters, replayEvent, endpointHealth } from "../services/eventService";
+
+
 
 export async function createEvent(req: Request, res: Response) {
   try {
@@ -42,5 +44,11 @@ export async function replay(
     message: "Replay scheduled",
     event,
   });
+}
+
+export async function health(req: Request, res: Response) {
+  const endpoints = await endpointHealth();
+
+  res.json(endpoints);
 }
 

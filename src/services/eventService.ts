@@ -1,14 +1,12 @@
+import { createEvent, getDeadLetters } from "../models/eventModel";
+import { getEventById, resetEvent, getEndpointHealth } from "../models/eventModel";
 
-import { createEvent,getDeadLetters} from "../models/eventModel";
-import { getEventById, resetEvent } from "../models/eventModel";
 export async function createWebhookEvent(destination: string, payload: object) {
   const event = await createEvent({
     destination,
     payload,
   });
-return event
-
-  
+  return event;
 }
 export async function replayEvent(id: string) {
   const event = await getEventById(id);
@@ -21,7 +19,10 @@ export async function replayEvent(id: string) {
 
   return await getEventById(id);
 }
-export async function listDeadLetters(){
+export async function listDeadLetters() {
   return getDeadLetters();
 }
-                         
+
+export async function endpointHealth() {
+  return getEndpointHealth();
+}
