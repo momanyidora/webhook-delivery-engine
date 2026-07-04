@@ -14,7 +14,7 @@ async function processPendingEvents() {
   for (const event of events) {
     const attemptNumber = event.attempts + 1;
 
-    const delivery = await deliverWebhook(event.destination, event.payload);
+    const delivery = await deliverWebhook(event.destination, event.payload, event.id);
 
     await createAttempt({
       eventId: event.id,

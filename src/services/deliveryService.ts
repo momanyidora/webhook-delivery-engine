@@ -8,6 +8,7 @@ export interface DeiveryResult{
 }
 
 export async function deliverWebhook(
+    eventId: string,
     destination: string,
     payload: object
 ): Promise<DeiveryResult>{
@@ -18,6 +19,7 @@ export async function deliverWebhook(
             headers: {
                 "Content-Type": "application/json",
                 "X-Signature": signature,
+                "X-Event-ID": eventId
             },
             body: JSON.stringify(payload)
         });
