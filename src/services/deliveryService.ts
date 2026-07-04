@@ -33,7 +33,7 @@ export async function deliverWebhook(
             errorMessage: response.statusText
         };
     }catch(error){
-        console.error(error);
+        // console.error(error);
  return{
     success: false,
     errorMessage:
