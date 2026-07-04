@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node dist/server.ts",
     "test": "vitest",
-    "test:run": "vitest run" 
+    "test:run": "vitest run" ,
+    "worker": "tsx src/workers/deliveryWorker.ts"
     },
   "keywords": [],
   "author": "Dorah",
