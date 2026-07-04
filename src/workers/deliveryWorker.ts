@@ -4,7 +4,7 @@ import {
   getPendingEvents,
   markDelivered,
   scheduleRetry,
-  markFailed,
+  moveToDeadLetter,
 } from "../models/eventModel";
 import { getNextAttemptTime } from "../services/retryService";
 
@@ -32,7 +32,7 @@ async function processPendingEvents() {
     const nextRetry = getNextAttemptTime(attemptNumber);
 
     if (!nextRetry) {
-      await markFailed(event.id);
+      await moveToDeadLetter(event.id, attemptNumber)
       continue;
     }
 

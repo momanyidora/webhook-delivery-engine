@@ -41,7 +41,15 @@ export async function updateEventStatus(
 }
 
 export async function getEventById(id: string) {
-  const result = await pool.query("SELECT * FROM events WHERE id = $1", [id]);
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM events
+    WHERE id=$1
+`,
+    [id],
+  );
+
   return result.rows[0];
 }
 export async function getPendingEvents() {
@@ -56,7 +64,20 @@ export async function getPendingEvents() {
 
   return result.rows;
 }
-
+export async function resetEvent(id: string) {
+  await pool.query(
+    `
+      UPDATE events
+      SET
+          status='pending',
+          attempts=0,
+          next_attempt_at=NOW(),
+          updated_at=NOW()
+      WHERE id=$1
+  `,
+    [id],
+  );
+}
 // helper that schedule the next retry
 
 export async function scheduleRetry(
@@ -101,4 +122,36 @@ export async function markFailed(id: string) {
 `,
     [id],
   );
+}
+
+
+export async function moveToDeadLetter(id: string, attempts: number){
+  await pool.query(
+    `
+    UPDATE events
+    SET
+     status='dead_letter',
+     attempts=$2,
+     updated_at=NOW()
+    WHERE id=$1
+    `,
+    [id, attempts]
+  );
+}
+
+
+
+export async function getDeadLetters(){
+  const result = await pool.query(`
+    SELECT
+        id,
+        destination,
+        attempts,
+        payload,
+        updated_at
+     FROM events
+     WHERE status='dead_letter'
+     ORDER BY updated_at DESC
+     `);
+     return result.rows;
 }
