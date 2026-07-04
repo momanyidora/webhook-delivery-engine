@@ -1,25 +1,23 @@
 # Webhook Delivery Engine
 
-A small reliability-focused service that delivers webhooks on behalf of a system that needs to notify other services when something happens (a payment succeeds, an order ships, a document gets signed, etc). Instead of firing a webhook straight off the request and hoping for the best, this engine queues it, signs it, retries it if it fails, and puts it in a dead-letter queue if it never comes through so nothing just silently disappears.
-
+A reliability-focused backend service that delivers webhooks for systems that need to notify other services when events occur, such as successful payments, shipped orders, or signed documents. Instead of sending webhooks directly during a request, the engine processes them asynchronously through a background worker, signs every payload with HMAC to verify authenticity, retries failed deliveries using a fixed backoff schedule, and moves events that exhaust all retry attempts to a dead-letter queue for inspection and replay. It also preserves a stable event identifier across retries and replays to support idempotent processing and monitors the health of destination endpoints, automatically pausing those that consistently fail to prevent unnecessary delivery attempts.
 
 
 ## What This System Does
 
-When an event happens, you POST it to this service with a destination URL and a payload. The service:
+Say some other system in our product needs to be notified when something happens a payment went through, an order shipped, whatever. Instead of just firing off an HTTP request and hoping for the best, this engine:
 
-1. Saves the event and returns immediately (it does **not** try to deliver the webhook inside that request).
-2. A background worker picks it up and sends it to the destination via HTTP POST.
-3. Every payload is HMAC-signed so the receiver can trust it actually came from us and wasn't tampered with.
-4. If delivery fails, it retries on a backoff schedule instead of giving up immediately.
-5. If it fails 5 times, it gets moved to a dead-letter queue where it can be inspected and manually replayed.
-6. The event's ID never changes across retries or replays, so a receiver that gets the same event twice can recognize the duplicate and ignore it.
-
-Basically: assume the receiver will be down sometimes, and design so that's fine.
+- Accepts the event (payload + destination URL) and immediately returns, without waiting for delivery
+- Delivers it in the background via a worker process
+- Retries it on a fixed backoff schedule if it fails
+- Signs the payload so the receiver can verify it actually came from us
+- Moves it to a dead-letter queue after it's failed too many times, instead of just losing it
+- Lets you manually replay a dead-lettered (or failed) event
+- Tracks how healthy each destination is, and stops sending to ones that are clearly broken
 
 ## Setup & Configuration
 
-Clone the repo and install dependencies:
+You'll need Node, npm, and PostgreSQL running locally.
 
 ```bash
 git clone https://github.com/momanyidora/webhook-delivery-engine.git
@@ -27,21 +25,21 @@ cd webhook-delivery-engine
 npm install
 ```
 
-Create a `.env` file in the project root 
+Create a `.env` file in the root (don't commit this):
+
 ```
 DATABASE_URL=postgres://postgres:yourpassword@localhost:5432/webhook_delivery_db
-WEBHOOK_SIGNING_SECRET=your-secret-here
 PORT=3000
+WEBHOOK_SIGNING_SECRET=some-long-random-secret
 ```
 
-Then create the database and run the schema (tables for `events` and `delivery_attempts`):
+The secret is what's used to sign payloads see the signing section below. It's never hardcoded anywhere in the code, it's pulled from the environment.
 
-```bash
-sudo -u postgres psql
-CREATE DATABASE webhook_delivery_db;
-\c webhook_delivery_db
-\i schema.sql
-```
+Then create the database and run the table setup (events, delivery_attempts, and endpoints tables). I don't have a migration tool set up yet, so for now I just ran the CREATE TABLE statements directly in psql. That's on my known limitations list below.
+
+## Running the Worker
+
+The API and the worker are two separate processes. The API just accepts events and writes them to the DB it does not deliver anything itself. A background worker polls the database for events that are due and actually sends them.
 
 Start the API:
 
@@ -49,15 +47,13 @@ Start the API:
 npm run dev
 ```
 
-## Running the Worker
-
-Delivery happens off the request path, in a separate process. Open a second terminal and run:
+Start the worker (in a separate terminal):
 
 ```bash
 npm run worker
 ```
 
-This starts a loop that polls the `events` table for anything with a `status` of `pending` (or `failed`, if it's due for another attempt) and a `next_attempt_at` that has already passed, and attempts delivery. Because the schedule lives in Postgres and not in memory, if the worker crashes or the machine restarts, nothing gets lost the worker just picks back up where it left off next time it polls.
+If you only start the API and not the worker, events will just sit in `pending` forever, which is expected nothing gets delivered synchronously inside the request.
 
 ## Running Tests
 
@@ -65,19 +61,20 @@ This starts a loop that polls the `events` table for anything with a `status` of
 npm run test:run
 ```
 
-This runs the Vitest suite, which covers the retry schedule, HMAC signing, the delivery service, event creation, and replay behavior both success and failure paths.
+This runs everything in `/tests` once and exits (good for CI). If you want it to watch files while you work, just run `npm run test` instead.
+
+Tests cover the retry schedule, HMAC signature generation, replay behaviour, and the basic delivery/event flows, including both success and failure cases.
 
 ## Sending an Event for Delivery
+
+**Example 1 creating an event:**
 
 ```bash
 curl -X POST http://localhost:3000/events \
   -H "Content-Type: application/json" \
   -d '{
-    "destination": "https://example.com/webhook",
-    "payload": {
-      "orderId": 101,
-      "status": "paid"
-    }
+    "destination": "https://webhook.site/your-unique-url",
+    "payload": { "orderId": 101, "status": "paid" }
   }'
 ```
 
@@ -86,20 +83,19 @@ Response:
 ```json
 {
   "id": "f145e013-397e-459c-8dfc-9a4cf5200f52",
-  "destination": "https://example.com/webhook",
+  "destination": "https://webhook.site/your-unique-url",
   "payload": { "orderId": 101, "status": "paid" },
   "status": "pending",
   "attempts": 0,
-  "next_attempt_at": "2026-07-04T12:41:19.950Z",
-  "created_at": "2026-07-04T12:41:19.950Z"
+  "next_attempt_at": "2026-07-04T12:41:19.950Z"
 }
 ```
 
-The event is created with `status: pending` and picked up by the worker on the next poll the request itself doesn't wait around for delivery to happen.
+The event is created with `status: pending` and picked up by the worker on its next poll nothing is sent synchronously in this request.
 
 ## The Retry Schedule
 
-If a delivery attempt fails (anything that isn't a 2xx response including timeouts and no response at all), it's retried on this schedule:
+Failed deliveries follow a fixed backoff schedule:
 
 | Attempt | Delay before it |
 |---|---|
@@ -109,43 +105,32 @@ If a delivery attempt fails (anything that isn't a 2xx response including timeou
 | 4 | 30 minutes |
 | 5 | 2 hours |
 
-After the 5th failed attempt, the event stops retrying automatically and moves to the dead-letter queue instead. A successful attempt at any point stops all further retries the event just gets marked `delivered` and left alone.
+After the 5th failed attempt, the event is dead-lettered and is not retried automatically anymore. A successful attempt at any point stops all further retries the event's `status` moves to `delivered` and the worker leaves it alone.
 
-Each event tracks its own `attempts` count and `next_attempt_at` timestamp in the database, so the worker knows exactly what's due and when.
+Each event tracks its own `attempts` count and `next_attempt_at` timestamp in the database, so the schedule survives a restart of the worker process it's not held in memory anywhere.
+
+**Example 2 checking on an event's retry state:**
+
+```sql
+SELECT id, status, attempts, next_attempt_at FROM events;
+```
 
 ## Payload Signing (and How Receivers Verify It)
 
-Every payload is signed with HMAC-SHA256 using a secret that lives only in the server's environment (`WEBHOOK_SIGNING_SECRET`) it's never sent in the request itself.
+Every payload is signed with HMAC-SHA256 using a secret from the environment (`WEBHOOK_SIGNING_SECRET`), computed over the JSON payload. The signature is sent as a header, `X-Signature`, along with the event's own id in `X-Event-ID`. The secret itself is never sent anywhere.
 
-The signature goes out in a header:
+To verify a delivery, a receiver would:
 
-```
-X-Signature: <hmac-sha256 hex digest of the JSON payload>
-X-Event-ID: <event id>
-```
-
-**To verify it on the receiving end**, compute an HMAC-SHA256 of the exact request body you received, using the same shared secret, and compare it to the value in `X-Signature`. If they match, the payload is authentic and hasn't been altered in transit. If they don't match or the header is missing reject the request.
-
-Example (Node.js receiver):
-
-```js
-const crypto = require("crypto");
-
-function isValidSignature(rawBody, signature, secret) {
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex");
-
-  return expected === signature;
-}
-```
+1. Take the raw request body
+2. Compute `HMAC-SHA256(body, shared_secret)` themselves
+3. Compare it against the `X-Signature` header
+4. If they match, the payload is genuine and untampered; if not, reject it
 
 ## The Dead-Letter Queue
 
-Once an event has failed all 5 attempts, it's moved into the dead-letter queue instead of just getting dropped. Its full attempt history stays in the `delivery_attempts` table, so you can see exactly what happened on every try.
+If an event fails all 5 attempts, its `status` is set to `dead_letter` and the worker stops touching it. Its full attempt history stays in the `delivery_attempts` table, so you can see exactly what happened on every try.
 
-View what's currently dead-lettered:
+**Example 3 listing dead-lettered events:**
 
 ```bash
 curl http://localhost:3000/events/dead-letters
@@ -155,7 +140,7 @@ curl http://localhost:3000/events/dead-letters
 [
   {
     "id": "f145e013-397e-459c-8dfc-9a4cf5200f52",
-    "destination": "https://example.com/webhook",
+    "destination": "https://webhook.site/your-unique-url",
     "attempts": 5,
     "payload": { "orderId": 101, "status": "paid" },
     "updated_at": "2026-07-04T12:42:33.297Z"
@@ -163,48 +148,61 @@ curl http://localhost:3000/events/dead-letters
 ]
 ```
 
-An event that succeeds at any point before attempt 5 is never dead-lettered, and once something is dead-lettered it's not touched again by the background worker it just sits there until someone replays it.
-
 ## Replaying a Delivery
-
-Dead-lettered (or just currently-failed) events can be manually re-sent:
 
 ```bash
 curl -X POST http://localhost:3000/events/f145e013-397e-459c-8dfc-9a4cf5200f52/replay
 ```
 
-This resets the event's `status` back to `pending`, zeroes out `attempts`, and sets `next_attempt_at` to now so it behaves like a fresh delivery, and the worker picks it up on its next pass. Importantly, **it reuses the original event ID**, it doesn't generate a new one, since receivers rely on that ID staying stable to detect duplicates.
-
-Trying to replay an event that doesn't exist returns a 404:
-
-```json
-{ "message": "Event not found" }
-```
+This resets the event's `status` back to `pending`, resets `attempts` to 0, and sets `next_attempt_at` to now, so the worker picks it up again on its next pass. Importantly, it **keeps the same event id** nothing about the event's identity changes, only its delivery state. Replaying an event that doesn't exist returns a 404 instead of silently doing nothing.
 
 ## The Idempotency Design
 
-Retries and replays both mean a receiver can end up getting the exact same event more than once for example, if the webhook actually arrived but our record of that response got lost, or someone manually replays something that technically already went through.
+Since events get retried automatically and can also be replayed manually, a receiver might genuinely get the same webhook more than once (e.g. the delivery worked but our confirmation never came back). To make that safe:
 
-To make that safe:
+- Every event has a stable UUID assigned when it's first created
+- That same id is sent in the `X-Event-ID` header on every single attempt, whether it's a normal retry or a manual replay
+- The id never changes across retries or replays only the delivery attempt count and status change
 
-- Every event gets a UUID the moment it's created.
-- That ID **never changes**, no matter how many times it's retried or replayed.
-- The ID is sent with every single delivery attempt, in the `X-Event-ID` header, so a receiver doesn't have to dig through the payload body to find it.
-
-The receiver's side of the contract is: keep a record of event IDs you've already processed (even just recently-seen ones in a table or cache), and if an incoming `X-Event-ID` matches one you've already handled, skip re-processing it and just return a 2xx so we stop retrying. Since the ID is stable and always present in the header, that check is cheap and doesn't require parsing the payload at all.
+So on the receiving end, you'd keep a record of event ids you've already processed. If a webhook comes in with an id you've already seen, you just acknowledge it and skip processing it again, instead of double-charging a card or double-shipping an order or whatever the side effect would be.
 
 ## Endpoint Health & Auto-Pause
 
-**Not implemented in this submission.** I got through Phases 1–5 (delivery, signing, background processing + retries, dead-letter + replay, and idempotency/tests/docs) but ran out of time before I could build out the health scoring and auto-pause behavior from the requirement injection. Given more time, the plan would be:
+This part was added mid-sprint as a requirement injection, after most of the core engine was already working.
 
-- Track a rolling success rate per destination from the `delivery_attempts` table.
-- Convert that into a 0–100 health score, recalculated as new outcomes come in.
-- Automatically flag and pause any destination whose score drops below 20, and skip it in the worker's polling query until it's manually unpaused.
+Each destination endpoint (not each individual event I initially built this at the event level and then moved it into its own `endpoints` table once I realized the requirement was really about the endpoint) has a `health_score` between 0 and 100, starting at 100.
+
+- A successful delivery bumps the score up by 10 (capped at 100)
+- A failed delivery drops the score by 20 (floored at 0)
+- If an endpoint's score drops below 20, it's automatically marked `paused`
+
+A paused endpoint stops receiving delivery attempts entirely the worker's query for due events explicitly filters out anything tied to a paused endpoint, so it just sits there instead of continuing to hammer a dead URL.
+
+**Check endpoint health:**
+
+```bash
+curl http://localhost:3000/events/health
+```
+
+```json
+[
+  {
+    "destination": "http://localhost:9999/webhook",
+    "health_score": 0,
+    "paused": true
+  },
+  {
+    "destination": "https://webhook.site/your-unique-url",
+    "health_score": 100,
+    "paused": false
+  }
+]
+```
 
 ## Known Limitations
 
-- Endpoint health scoring and auto-pause (EXT-001 / EXT-002) are not implemented yet see above.
-- The worker polls the database on an interval rather than using a proper job queue (like BullMQ/Redis-backed), so there's a small window of latency between an attempt being "due" and actually being picked up.
-- There's no authentication on the API endpoints themselves yet anyone who can reach the service can create or replay events.
-- Retry delays are real-time (1m / 5m / 30m / 2h), so end-to-end testing of the full schedule takes hours unless you use the shortened delays in the retry simulation tests.
-- No pagination on `GET /events/dead-letters` fine for now, but would need it if the DLQ grows large.
+- No proper migration tool yet table changes were applied by hand in `psql`, so setting this up fresh means running the CREATE TABLE / ALTER TABLE statements yourself in order.
+- Once an endpoint is paused, there's no automatic un-pause. You'd currently have to manually reset its health score in the database to bring it back into rotation.
+- The health score logic is intentionally simple  rather than a proper rolling success-rate calculation over a time window good enough to demonstrate the behaviour for this sprint, but I'd want to revisit it for anything real.
+- Retry timing is checked by polling rather than a true scheduled job queue, so there's a small delay between when something becomes "due" and when the worker actually picks it up, depending on the poll interval.
+- Test coverage exists for the core behaviours but isn't exhaustive on every edge case yet I focused on the ones the sprint explicitly asked for (retry schedule, dead-letter after 5, success stopping retries).

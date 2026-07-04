@@ -4,9 +4,10 @@ import {
   getPendingEvents,
   markDelivered,
   scheduleRetry,
-  moveToDeadLetter,
+  moveToDeadLetter, updateEndpointHealth
 } from "../models/eventModel";
 import { getNextAttemptTime } from "../services/retryService";
+
 
 async function processPendingEvents() {
   const events = await getPendingEvents();
@@ -16,6 +17,8 @@ async function processPendingEvents() {
 
     const delivery = await deliverWebhook(event.destination, event.payload, event.id);
 
+   await updateEndpointHealth(event.endpoint_id, delivery.success);
+   
     await createAttempt({
       eventId: event.id,
       attemptNumber,
@@ -32,12 +35,14 @@ async function processPendingEvents() {
     const nextRetry = getNextAttemptTime(attemptNumber);
 
     if (!nextRetry) {
+      console.log("Moving event to dead letter queue");
       await moveToDeadLetter(event.id, attemptNumber)
       continue;
     }
 
     await scheduleRetry(event.id, attemptNumber, nextRetry);
   }
+  
 }
 processPendingEvents();
 setInterval(processPendingEvents, 5000);
